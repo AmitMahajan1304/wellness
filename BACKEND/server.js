@@ -1,116 +1,152 @@
-// --- 1. Imports ---
-require('dotenv').config(); // Loads .env file credentials
-const express = require('express');
-const { Pool } = require('pg');       // PostgreSQL driver
-const bcrypt = require('bcryptjs');   // For hashing passwords
-const jwt = require('jsonwebtoken');  // For JWT (auth)
-const cors = require('cors');         // For allowing frontend access
+// BACKEND/server.js
+import dotenv from "dotenv";
+import express from "express";
+import { Pool } from "pg";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import cors from "cors";
 
-// --- 2. Setup & Middleware ---
+dotenv.config();
+
 const app = express();
-app.use(cors());                      // Allow all cross-origin requests
-app.use(express.json());              // Parse incoming JSON bodies
+app.use(express.json());
+app.use(cors());
 
-// --- 3. Database Connection (D1, D2, D3 from DFD) ---
+// ✅ Database connection
 const pool = new Pool({
-    connectionString: process.env.DB_CONNECT_STRING,
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+  // Note: Aapka purana code NODE_ENV check kar raha tha, 
+  // lekin Render ke liye simple "rejectUnauthorized: false" hamesha kaam karega.
 });
 
-const JWT_SECRET = process.env.JWT_SECRET;
-const PORT = process.env.PORT || 3000;
-
-// --- 4. API Endpoints (The "Arrows" from your DFD) ---
-
-/*
- * @endpoint   POST /api/register
- * @desc       Matches "Sign-up" flow from DFD
- * Matches "signUp()" from Class Diagram
- */
-app.post('/api/register', async (req, res) => {
-    try {
-        const { email, password } = req.body;
-
-        if (!email || !password) {
-            return res.status(400).json({ message: 'Email and password are required.' });
-        }
-
-        // --- Hashing the password (from SRS) ---
-        const salt = await bcrypt.genSalt(10);
-        const password_hash = await bcrypt.hash(password, salt);
-
-        // --- Store in D1: User DB ---
-        const newUser = await pool.query(
-            "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email",
-            [email, password_hash]
+// =============================
+// 📋 DATABASE TABLE CREATION
+// =============================
+async function createTables() {
+    const tableQueries = `
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        res.status(201).json(newUser.rows[0]);
+        CREATE TABLE IF NOT EXISTS journal (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            entry TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
 
-    } catch (err) {
-        console.error(err.message);
-        if (err.code === '23505') { // Unique constraint violation
-            return res.status(400).json({ message: 'Email already exists.' });
-        }
-        res.status(500).send('Server Error');
-    }
-});
+        CREATE TABLE IF NOT EXISTS mood (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            mood_value TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
 
-
-/*
- * @endpoint   POST /api/login
- * @desc       Matches "Sign-up/Login" flow from DFD
- * Matches "login()" from Class Diagram
- */
-app.post('/api/login', async (req, res) => {
+        CREATE TABLE IF NOT EXISTS chat (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            message TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    `;
+    
     try {
-        const { email, password } = req.body;
-
-        // 1. Find user in D1: User DB
-        const userResult = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
-        const user = userResult.rows[0];
-
-        if (!user) {
-            // Don't tell the attacker "user not found"
-            return res.status(401).json({ message: 'Invalid credentials.' });
-        }
-
-        // 2. Compare hashed password
-        const isMatch = await bcrypt.compare(password, user.password_hash);
-
-        if (!isMatch) {
-            return res.status(401).json({ message: 'Invalid credentials.' });
-        }
-
-        // 3. Create JWT (as specified in SRS)
-        const payload = {
-            user: {
-                id: user.id,
-                email: user.email
-            }
-        };
-
-        const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
-
-        // 4. Send token back to frontend
-        res.status(200).json({
-            token: token,
-            message: 'Login successful!'
-        });
-
+        await pool.query(tableQueries);
+        console.log('✅ Tables created successfully (if they did not exist)!');
     } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
+        console.error('❌ Error creating tables:', err);
     }
+}
+
+// Connect to DB and then create tables
+pool.connect()
+  .then(() => {
+    console.log("✅ Connected to PostgreSQL Database");
+    // Connect hone ke baad, tables create karo
+    createTables(); 
+  })
+  .catch((err) => console.error("❌ Database connection failed:", err.message));
+
+
+// 🧠 Health check
+app.get("/", (req, res) => {
+  res.send("🧠 Mental Wellness Backend running successfully!");
 });
 
-/*
- * TODO: Add a middleware function here to *check* the JWT on
- * protected routes (like posting a journal entry).
- * This middleware will be the "Authentication" arrow from your DFD.
- */
+// =============================
+// 🔐 AUTH ROUTES
+// =Example...
+// =============================
+
+// SIGNUP
+app.post("/api/auth/signup", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password)
+      return res.status(400).json({ message: "Email and password required" });
+
+    const existing = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    if (existing.rows.length > 0)
+      return res.status(400).json({ message: "Email already registered" });
+
+    const hashed = await bcrypt.hash(password, 10);
+
+    const result = await pool.query(
+      `INSERT INTO users (email, password) VALUES ($1, $2) RETURNING id, email`,
+      [email, hashed]
+    );
+
+    res.status(201).json({ message: "User created successfully", user: result.rows[0] });
+  } catch (err) {
+    console.error("Signup error:", err);
+    res.status(500).json({ message: "Error creating user" });
+  }
+});
+
+// LOGIN
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    const userRes = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    if (userRes.rows.length === 0)
+      return res.status(404).json({ message: "User not found" });
+
+    const user = userRes.rows[0];
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid)
+      return res.status(400).json({ message: "Invalid credentials" });
+
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      process.env.JWT_SECRET, // Make sure to set JWT_SECRET in Render
+      { expiresIn: "2h" }
+    );
+
+    res.status(200).json({
+      message: "Login successful",
+      token,
+      email: user.email
+    });
+  } catch (err) {
+    console.error("Login error:", err);
+    res.status(500).json({ message: "Error logging in" });
+  }
+});
 
 
-// --- 5. Start Server ---
+// =============================
+// 🚀 START SERVER
+// =============================
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-    console.log(`Backend server (Process 0) is running on http://localhost:${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
